@@ -1,0 +1,31 @@
+name: arxiv Daily Digest
+
+on:
+  schedule:
+    # Runs every day at 07:00 UTC (09:00 CEST / 08:00 CET)
+    - cron: "0 7 * * 1-5"   # Monday–Friday only
+  workflow_dispatch:          # lets you also trigger it manually from GitHub UI
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install arxiv google-generativeai
+
+      - name: Run digest script
+        env:
+          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_ADDRESS:     ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TO_EMAIL:          ${{ secrets.TO_EMAIL }}
+        run: python digest.py
