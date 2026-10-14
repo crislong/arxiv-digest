@@ -5,6 +5,7 @@ Uses Gemini Flash (free) to filter and summarize, then sends via Gmail.
 
 import arxiv
 from google import genai
+from google.genai import errors as genai_errors
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -41,50 +42,80 @@ def fetch_recent_papers(category: str, max_results: int) -> list[arxiv.Result]:
     return results
 
 
-def score_and_summarize(paper: arxiv.Result, client) -> dict | None:
+def generate_with_retry(client, prompt: str, attempts: int = 6) -> str:
+    """Call Gemini, retrying on transient overload (503) and rate limits (429)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config={"response_mime_type": "application/json"},
+            )
+            return response.text
+        except genai_errors.APIError as e:
+            if e.code not in (429, 500, 503) or attempt == attempts:
+                raise
+            wait = 30 * attempt
+            print(f"   ⏳ Gemini {e.code}, retry {attempt}/{attempts - 1} in {wait}s...")
+            time.sleep(wait)
+
+
+def score_papers(papers: list[arxiv.Result], client) -> list[dict]:
     """
-    Ask Gemini to:
-      1. Score relevance for planetary formation research (1-10)
-      2. If relevant (≥ threshold), produce a short summary + comment
-    Returns a dict with paper info, or None if not relevant.
-    Raises on API/parsing errors so the caller can count failures.
+    Ask Gemini, in a single request (free tier allows few requests/minute), to:
+      1. Score each paper's relevance for planetary formation research (1-10)
+      2. For relevant ones (≥ threshold), produce a short summary + comment
+    Returns the relevant papers as dicts.
     """
+    papers_text = "\n\n".join(
+        f"""[{i}]
+Title: {p.title}
+Authors: {', '.join(a.name for a in p.authors[:5])}{' et al.' if len(p.authors) > 5 else ''}
+Abstract: {p.summary}"""
+        for i, p in enumerate(papers)
+    )
     prompt = f"""You are an astrophysics researcher specialising in planetary formation.
 
 Research interests: {RESEARCH_INTEREST}
 
-Evaluate this arxiv paper:
-Title: {paper.title}
-Authors: {', '.join(a.name for a in paper.authors[:5])}{' et al.' if len(paper.authors) > 5 else ''}
-Abstract: {paper.summary}
+Evaluate each of these arxiv papers:
 
-Reply with ONLY a JSON object (no markdown, no explanation) in this exact format:
-{{
-  "score": <integer 1-10, how relevant is this for planetary formation research>,
-  "reason": "<one sentence: why relevant or not>",
-  "summary": "<if score >= {RELEVANCE_THRESHOLD}: 2-3 sentence plain-language summary of the paper's contribution; else empty string>",
-  "comment": "<if score >= {RELEVANCE_THRESHOLD}: 1-2 sentence comment on why this could matter for planetary formation research; else empty string>"
-}}"""
+{papers_text}
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config={"response_mime_type": "application/json"},
-    )
-    text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    data = json.loads(text)
-    score = int(data.get("score", 0))
-    if score >= RELEVANCE_THRESHOLD:
-        return {
-            "title":   paper.title,
-            "authors": ', '.join(a.name for a in paper.authors[:4]) + (' et al.' if len(paper.authors) > 4 else ''),
-            "url":     paper.entry_id,
-            "score":   score,
-            "reason":  data.get("reason", ""),
-            "summary": data.get("summary", ""),
-            "comment": data.get("comment", ""),
-        }
-    return None
+Reply with ONLY a JSON array (no markdown, no explanation), one object per paper, in this exact format:
+[
+  {{
+    "id": <the paper's number in square brackets>,
+    "score": <integer 1-10, how relevant is this for planetary formation research>,
+    "reason": "<one sentence: why relevant or not>",
+    "summary": "<if score >= {RELEVANCE_THRESHOLD}: 2-3 sentence plain-language summary of the paper's contribution; else empty string>",
+    "comment": "<if score >= {RELEVANCE_THRESHOLD}: 1-2 sentence comment on why this could matter for planetary formation research; else empty string>"
+  }}
+]"""
+
+    text = generate_with_retry(client, prompt)
+    text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    results = json.loads(text)
+
+    relevant = []
+    for data in results:
+        idx = int(data.get("id", -1))
+        if not 0 <= idx < len(papers):
+            continue
+        paper = papers[idx]
+        score = int(data.get("score", 0))
+        print(f"   [{idx + 1}/{len(papers)}] {score}/10 — {paper.title[:70]}")
+        if score >= RELEVANCE_THRESHOLD:
+            relevant.append({
+                "title":   paper.title,
+                "authors": ', '.join(a.name for a in paper.authors[:4]) + (' et al.' if len(paper.authors) > 4 else ''),
+                "url":     paper.entry_id,
+                "score":   score,
+                "reason":  data.get("reason", ""),
+                "summary": data.get("summary", ""),
+                "comment": data.get("comment", ""),
+            })
+    return relevant
 
 
 def build_html_email(papers: list[dict], date_str: str) -> str:
@@ -174,29 +205,11 @@ def main():
     # Fetch papers
     papers = fetch_recent_papers(CATEGORY, MAX_PAPERS)
 
-    # Filter & summarize
-    relevant = []
-    errors = 0
-    for i, paper in enumerate(papers, 1):
-        print(f"   [{i}/{len(papers)}] {paper.title[:70]}...")
-        try:
-            result = score_and_summarize(paper, client)
-        except Exception as e:
-            errors += 1
-            print(f"      ⚠️  Error: {e}")
-            time.sleep(1.5)
-            continue
-        if result:
-            relevant.append(result)
-            print(f"      ✅ Score {result['score']}/10 — kept")
-        else:
-            print(f"      ⏭️  Not relevant enough")
-        time.sleep(1.5)  # be polite to the API (free tier rate limits)
-
     if not papers:
         raise SystemExit("❌ No papers returned by arxiv")
-    if errors == len(papers):
-        raise SystemExit("❌ Gemini failed on every paper — not sending an empty digest")
+
+    # Filter & summarize
+    relevant = score_papers(papers, client)
 
     # Sort by score descending
     relevant.sort(key=lambda x: x["score"], reverse=True)
