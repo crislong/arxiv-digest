@@ -4,7 +4,7 @@ Uses Gemini Flash (free) to filter and summarize, then sends via Gmail.
 """
 
 import arxiv
-import google.generativeai as genai
+from google import genai
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -17,6 +17,7 @@ CATEGORY = "astro-ph.EP"
 RESEARCH_INTEREST = "planetary formation, protoplanetary disks, planet formation mechanisms, dust and gas dynamics in disks, planetesimal formation, pebble accretion, giant planet formation, terrestrial planet formation"
 MAX_PAPERS = 10          # how many recent papers to pull from arxiv
 RELEVANCE_THRESHOLD = 6  # out of 10 — tune this up/down to be more/less selective
+GEMINI_MODEL = "gemini-2.5-flash"
 
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 GMAIL_ADDRESS   = os.environ["GMAIL_ADDRESS"]
@@ -34,12 +35,12 @@ def fetch_recent_papers(category: str, max_results: int) -> list[arxiv.Result]:
         sort_by=arxiv.SortCriterion.SubmittedDate,
         sort_order=arxiv.SortOrder.Descending,
     )
-    results = list(search.results())
+    results = list(arxiv.Client().results(search))
     print(f"   → Found {len(results)} papers")
     return results
 
 
-def score_and_summarize(paper: arxiv.Result, model) -> dict | None:
+def score_and_summarize(paper: arxiv.Result, client) -> dict | None:
     """
     Ask Gemini to:
       1. Score relevance for planetary formation research (1-10)
@@ -64,7 +65,7 @@ Reply with ONLY a JSON object (no markdown, no explanation) in this exact format
 }}"""
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         import json
         text = response.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         data = json.loads(text)
@@ -165,8 +166,7 @@ def main():
     print(f"\n🌌 arxiv Digest — {date_str}\n{'─'*50}")
 
     # Init Gemini
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     # Fetch papers
     papers = fetch_recent_papers(CATEGORY, MAX_PAPERS)
@@ -175,7 +175,7 @@ def main():
     relevant = []
     for i, paper in enumerate(papers, 1):
         print(f"   [{i}/{len(papers)}] {paper.title[:70]}...")
-        result = score_and_summarize(paper, model)
+        result = score_and_summarize(paper, client)
         if result:
             relevant.append(result)
             print(f"      ✅ Score {result['score']}/10 — kept")
