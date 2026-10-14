@@ -9,6 +9,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
+import json
 import os
 import time
 
@@ -46,6 +47,7 @@ def score_and_summarize(paper: arxiv.Result, client) -> dict | None:
       1. Score relevance for planetary formation research (1-10)
       2. If relevant (≥ threshold), produce a short summary + comment
     Returns a dict with paper info, or None if not relevant.
+    Raises on API/parsing errors so the caller can count failures.
     """
     prompt = f"""You are an astrophysics researcher specialising in planetary formation.
 
@@ -53,7 +55,7 @@ Research interests: {RESEARCH_INTEREST}
 
 Evaluate this arxiv paper:
 Title: {paper.title}
-Authors: {', '.join(a.name for a in paper.authors[:5])}{'et al.' if len(paper.authors) > 5 else ''}
+Authors: {', '.join(a.name for a in paper.authors[:5])}{' et al.' if len(paper.authors) > 5 else ''}
 Abstract: {paper.summary}
 
 Reply with ONLY a JSON object (no markdown, no explanation) in this exact format:
@@ -64,23 +66,24 @@ Reply with ONLY a JSON object (no markdown, no explanation) in this exact format
   "comment": "<if score >= {RELEVANCE_THRESHOLD}: 1-2 sentence comment on why this could matter for planetary formation research; else empty string>"
 }}"""
 
-    try:
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        import json
-        text = response.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        data = json.loads(text)
-        if data.get("score", 0) >= RELEVANCE_THRESHOLD:
-            return {
-                "title":   paper.title,
-                "authors": ', '.join(a.name for a in paper.authors[:4]) + (' et al.' if len(paper.authors) > 4 else ''),
-                "url":     paper.entry_id,
-                "score":   data["score"],
-                "reason":  data.get("reason", ""),
-                "summary": data.get("summary", ""),
-                "comment": data.get("comment", ""),
-            }
-    except Exception as e:
-        print(f"   ⚠️  Error processing '{paper.title[:60]}...': {e}")
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config={"response_mime_type": "application/json"},
+    )
+    text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    data = json.loads(text)
+    score = int(data.get("score", 0))
+    if score >= RELEVANCE_THRESHOLD:
+        return {
+            "title":   paper.title,
+            "authors": ', '.join(a.name for a in paper.authors[:4]) + (' et al.' if len(paper.authors) > 4 else ''),
+            "url":     paper.entry_id,
+            "score":   score,
+            "reason":  data.get("reason", ""),
+            "summary": data.get("summary", ""),
+            "comment": data.get("comment", ""),
+        }
     return None
 
 
@@ -173,15 +176,27 @@ def main():
 
     # Filter & summarize
     relevant = []
+    errors = 0
     for i, paper in enumerate(papers, 1):
         print(f"   [{i}/{len(papers)}] {paper.title[:70]}...")
-        result = score_and_summarize(paper, client)
+        try:
+            result = score_and_summarize(paper, client)
+        except Exception as e:
+            errors += 1
+            print(f"      ⚠️  Error: {e}")
+            time.sleep(1.5)
+            continue
         if result:
             relevant.append(result)
             print(f"      ✅ Score {result['score']}/10 — kept")
         else:
             print(f"      ⏭️  Not relevant enough")
         time.sleep(1.5)  # be polite to the API (free tier rate limits)
+
+    if not papers:
+        raise SystemExit("❌ No papers returned by arxiv")
+    if errors == len(papers):
+        raise SystemExit("❌ Gemini failed on every paper — not sending an empty digest")
 
     # Sort by score descending
     relevant.sort(key=lambda x: x["score"], reverse=True)
