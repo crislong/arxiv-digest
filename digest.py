@@ -19,7 +19,7 @@ CATEGORY = "astro-ph.EP"
 RESEARCH_INTEREST = "planetary formation, protoplanetary disks, planet formation mechanisms, dust and gas dynamics in disks, planetesimal formation, pebble accretion, giant planet formation, terrestrial planet formation"
 MAX_PAPERS = 10          # how many recent papers to pull from arxiv
 RELEVANCE_THRESHOLD = 6  # out of 10 — tune this up/down to be more/less selective
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest"]  # tried in order
 
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 GMAIL_ADDRESS   = os.environ["GMAIL_ADDRESS"]
@@ -42,22 +42,54 @@ def fetch_recent_papers(category: str, max_results: int) -> list[arxiv.Result]:
     return results
 
 
-def generate_with_retry(client, prompt: str, attempts: int = 6) -> str:
-    """Call Gemini, retrying on transient overload (503) and rate limits (429)."""
-    for attempt in range(1, attempts + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config={"response_mime_type": "application/json"},
-            )
-            return response.text
-        except genai_errors.APIError as e:
-            if e.code not in (429, 500, 503) or attempt == attempts:
-                raise
-            wait = 30 * attempt
-            print(f"   ⏳ Gemini {e.code}, retry {attempt}/{attempts - 1} in {wait}s...")
+def candidate_models(client) -> list[str]:
+    """Preferred models first, then any other Flash model this API key can use."""
+    models = list(GEMINI_MODELS)
+    try:
+        for m in client.models.list():
+            name = m.name.removeprefix("models/")
+            actions = getattr(m, "supported_actions", None) or []
+            if ("flash" in name and "generateContent" in actions
+                    and not any(x in name for x in ("image", "tts", "audio", "live", "embedding"))
+                    and name not in models):
+                models.append(name)
+    except Exception as e:
+        print(f"   ⚠️  Could not list models: {e}")
+    return models
+
+
+def generate_with_fallback(client, prompt: str, rounds: int = 4) -> str:
+    """
+    Call Gemini, falling back across models on overload (503), rate limit (429)
+    or unavailable model (404), and waiting between rounds.
+    """
+    models = candidate_models(client)
+    print(f"   🤖 Candidate models: {', '.join(models)}")
+    last_error = None
+    for rnd in range(1, rounds + 1):
+        for model in list(models):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"},
+                )
+                print(f"   ✅ Answered by {model}")
+                return response.text
+            except genai_errors.APIError as e:
+                last_error = e
+                print(f"   ⚠️  {model}: {e.code} {e.status}")
+                if e.code in (400, 404):
+                    models.remove(model)  # not usable with this key — don't retry it
+                elif e.code not in (429, 500, 503):
+                    raise
+        if not models:
+            break
+        if rnd < rounds:
+            wait = 60 * rnd
+            print(f"   ⏳ All models busy, retry round {rnd + 1}/{rounds} in {wait}s...")
             time.sleep(wait)
+    raise RuntimeError(f"Gemini unavailable on every model: {last_error}")
 
 
 def score_papers(papers: list[arxiv.Result], client) -> list[dict]:
@@ -93,7 +125,7 @@ Reply with ONLY a JSON array (no markdown, no explanation), one object per paper
   }}
 ]"""
 
-    text = generate_with_retry(client, prompt)
+    text = generate_with_fallback(client, prompt)
     text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     results = json.loads(text)
 
