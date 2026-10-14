@@ -18,7 +18,7 @@ CATEGORY = "astro-ph.EP"
 RESEARCH_INTEREST = "planetary formation, protoplanetary disks, planet formation mechanisms, dust and gas dynamics in disks, planetesimal formation, pebble accretion, giant planet formation, terrestrial planet formation"
 MAX_PAPERS = 10          # how many recent papers to pull from arxiv
 RELEVANCE_THRESHOLD = 6  # out of 10 — tune this up/down to be more/less selective
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 GMAIL_ADDRESS   = os.environ["GMAIL_ADDRESS"]
